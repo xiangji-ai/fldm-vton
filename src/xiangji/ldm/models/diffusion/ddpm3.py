@@ -474,6 +474,7 @@ class LatentDiffusion(DDPM):
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
         self.learnable_vector = nn.Parameter(torch.randn((1,1,768)), requires_grad=True)
         self.proj_out=nn.Linear(1024, 768)
+        
         ############################    take off module    ############################
         # self.takeoffmodule=AFWM()
         # takeoff_dir= '/data/warp_epoch_016.pth'
@@ -491,6 +492,7 @@ class LatentDiffusion(DDPM):
         # self.criterionL1 = nn.L1Loss(reduction='none')
         # self.criterionVGG = VGGLoss()
         ###############################################################################
+
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
@@ -969,11 +971,8 @@ class LatentDiffusion(DDPM):
         # loss = self(x.to(torch.float16), c.to(torch.float16))
         return loss
 
-    def sample_hijack(self, x_start, cond, t, zcloth=None,noise=None):
+    def sample2img(self, x_start, cond, t, zcloth=None,noise=None):
         if self.first_stage_key == 'inpaint':
-            # x_start=x_start[:,:4,:,:]
-            # noise = default(noise, lambda: torch.randn_like(x_start[:,:4,:,:]))
-            # noise = x_start[:, 4:8, :, :]
             noise = torch.randn_like(x_start[:, :4, :, :])
             if zcloth!=None:
                 x_noisy = self.q_sample(x_start=zcloth, t=t, noise=noise)
@@ -1001,22 +1000,15 @@ class LatentDiffusion(DDPM):
         warped_cloth = F.grid_sample(imcloth, last_flow.permute(0, 2, 3, 1),
                                      mode='bilinear', padding_mode='border')
 
-        mask = torch.where(t >=0, torch.tensor(1), torch.tensor(0))
         loss_l1_all = 0
         loss_vgg_all = 0
         loss_grad_all=0
-        # for num in range(5):
+
+
         num=4
         cur_person_clothes = F.interpolate(person_clothes, scale_factor=0.5 ** (4 - num), mode='bilinear')
         loss_l1 = self.criterionL1(warped_cloth, cur_person_clothes.cuda())
-        # loss_vgg = self.criterionVGG(x_all[num], cur_person_clothes.cuda(), mask)
-        # loss_grad = self.criterionL1(kornia.filters.SpatialGradient()(x_all[num]),
-        #                         kornia.filters.SpatialGradient()(cur_person_clothes.cuda()))
-        loss_l1[mask == 0] = 0
-        # loss_grad[mask == 0] = 0
         loss_l1_all +=  torch.mean(loss_l1)
-        # loss_vgg_all +=  loss_vgg
-        # loss_grad_all += torch.mean(loss_grad)
 
         return loss_l1_all, loss_vgg_all,loss_grad_all
 
@@ -1029,28 +1021,21 @@ class LatentDiffusion(DDPM):
             if self.cond_stage_trainable:
                 c = self.get_learned_conditioning(c)
                 c = self.proj_out(c)
-        # noise=z_cloth
-        # noise=torch.randn_like(x[:, :4, :, :])
+
         if self.u_cond_prop < self.u_cond_percent:
             loss_e, loss_dict = self.p_losses(x, self.learnable_vector.repeat(x.shape[0], 1, 1), t, *args,
                                                **kwargs)
             loss_e2,_ =self.reconp_losses(x, self.learnable_vector.repeat(x.shape[0], 1, 1), t,zcloth=z_cloth)
             loss_dict.update({'train/loss_e2': loss_e2})
-            x_pred = self.sample_hijack(x, self.learnable_vector.repeat(x.shape[0], 1, 1), t,zcloth=z_cloth)
-            # x_pred2 = self.sample_hijack(x, self.learnable_vector.repeat(x.shape[0], 1, 1), t)
+            x_pred = self.sample2img(x, self.learnable_vector.repeat(x.shape[0], 1, 1), t,zcloth=z_cloth)
         else:
             loss_e, loss_dict =  self.p_losses(x, c, t, *args, **kwargs)
             loss_e2, _ = self.reconp_losses(x, c, t, zcloth=z_cloth)
             loss_dict.update({'train/loss_e2': loss_e2})
-            x_pred = self.sample_hijack(x, c, t,zcloth=z_cloth)
-            # x_pred2 = self.sample_hijack(x, c, t)
-        loss +=loss_e
-        loss += loss_e2
-        # loss_grad_weight = 5 #1
-        loss_l1_weight = 3e-1 #1e-1
-        # loss_l1_weight = 3e-1  # 1e-1
-        # loss_vgg_weight= 0
-        # loss_vgg_weight = 2e-3
+            x_pred = self.ample2img(x, c, t,zcloth=z_cloth)
+        loss +=0.5*(loss_e+loss_e2)
+        loss_l1_weight = 15e-2 #1e-1
+
         # epoch threshold for calculating
         if self.current_epoch >=0:
             if len(takeoff_input['im_cloth_position'].shape)==3:
@@ -1058,28 +1043,16 @@ class LatentDiffusion(DDPM):
             else:
                 im_cloth_position = takeoff_input['im_cloth_position']
             x_samples = self.differentiable_decode_first_stage(x_pred).clamp(-1., 1.)
-            # print(x_samples.shape)
-            # print(im_cloth_position.shape)
             im_cloth_novel= x_samples*im_cloth_position
             im_cloth_position_down=F.interpolate(im_cloth_position, size=(256, 192), mode='nearest')
             x_samples_down = F.interpolate(x_samples, size=(256, 192), mode='bilinear')
             cloth_position_down= F.interpolate(takeoff_input['cloth_position'], size=(256, 192), mode='nearest')
-            #
-            #
             takeoff_output = self.takeoffmodule(cloth_position_down, x_samples_down * im_cloth_position_down)
             loss_l1, loss_vgg,loss_grad = self.get_takeoff_loss(takeoff_output,im_cloth_novel, takeoff_input['cloth_mask'], t)
 
-            # x_sample2 = self.differentiable_decode_first_stage(x_pred2).clamp(-1., 1.)
-            # takeoff_output2 = self.takeoffmodule(takeoff_input['cloth_position'], x_sample2 * im_cloth_position)
-            # loss_l12, loss_vgg2, loss_grad2 = self.get_takeoff_loss(takeoff_output2, takeoff_input['cloth_mask'], t)
-            # loss +=(loss_l1+loss_l12) * loss_l1_weight
             loss +=loss_l1* loss_l1_weight
             loss_dict.update({'train/loss_takeoff_l1': loss_l1 * loss_l1_weight})
-            # loss_dict.update({'train/loss_takeoff_l12': loss_l12 * loss_l1_weight})
-            # loss += loss_vgg * loss_vgg_weight
-            # loss_dict.update({'train/loss_takeoff_vgg': loss_vgg * loss_vgg_weight})
-            # loss += loss_grad * loss_grad_weight
-            # loss_dict.update({'train/loss_takeoff_grad': loss_grad * loss_grad_weight})
+
         else:
             loss_l1=0.
             loss_vgg=0.
@@ -1087,9 +1060,6 @@ class LatentDiffusion(DDPM):
             'estimated_loss': loss_e,
             'estimated_loss_2': loss_e2,
             'loss_takeoff_l1': loss_l1 * loss_l1_weight,
-            # 'loss_takeoff_l12': loss_l12 * loss_l1_weight,
-            # 'loss_takeoff_vgg': loss_vgg * loss_vgg_weight,
-            # 'loss_takeoff_grad':loss_grad * loss_grad_weight,
             'loss_all': loss
         })
         return loss, loss_dict
@@ -1240,11 +1210,8 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         self.logvar = self.logvar.to(self.device)
-        # print("self.logvar", self.logvar.type(), self.logvar.device)
-        # print("t", t.type(),t.device)
         logvar_t = self.logvar[t].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
@@ -1286,11 +1253,8 @@ class LatentDiffusion(DDPM):
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
 
         self.logvar=self.logvar.to(self.device)
-        # print("self.logvar", self.logvar.type(), self.logvar.device)
-        # print("t", t.type(),t.device)
         logvar_t = self.logvar[t].to(self.device)
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
@@ -1357,7 +1321,6 @@ class LatentDiffusion(DDPM):
         noise = noise_like(x.shape, device, repeat_noise) * temperature
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
-        # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
 
         if return_codebook_ids:
@@ -1402,11 +1365,6 @@ class LatentDiffusion(DDPM):
 
         for i in iterator:
             ts = torch.full((b,), i, device=self.device, dtype=torch.long)
-            # if self.shorten_cond_schedule:
-            #     assert self.model.conditioning_key != 'hybrid'
-            #     tc = self.cond_ids[ts].to(cond.device)
-            #     cond = self.q_sample(x_start=cond, t=tc, noise=torch.randn_like(cond))
-
             img, x0_partial = self.p_sample(img, cond, ts,
                                             clip_denoised=self.clip_denoised,
                                             quantize_denoised=quantize_denoised, return_x0=True,
@@ -1568,8 +1526,6 @@ class LatentDiffusion(DDPM):
                     z_noisy2 = torch.cat((z_noisy2, z_start[:, 4:, :, :]), dim=1)
 
                     # original
-                    # noise = torch.randn_like(z_start)
-                    # z_noisy = self.q_sample(x_start=z_start, t=t, noise=noise)
                     diffusion_row.append(self.decode_first_stage(z_noisy))
                     diffusion_row2.append(self.decode_first_stage(z_noisy2))
 
@@ -1703,7 +1659,6 @@ class DiffusionWrapper(pl.LightningModule):
         elif self.conditioning_key == 'crossattn':
             cc = torch.cat(c_crossattn, 1)
             out = self.diffusion_model(x, t, context=cc)
-            # out = self.diffusion_model(x.to(torch.float16), t.to(torch.float16), context=cc.to(torch.float16))
         elif self.conditioning_key == 'hybrid':
             xc = torch.cat([x] + c_concat, dim=1)
             cc = torch.cat(c_crossattn, 1)
